@@ -8,7 +8,8 @@ RUN apt-get install -y g++-11 make python3 python-is-python3 pip
 # only copy what's needed at every step to optimize layer cache
 COPY ./requirements.txt .
 # use BuildKit cache mount to drastically reduce redownloading from pip on repeated builds
-RUN --mount=type=cache,target=/root/.cache CMAKE_ARGS="-DLLAMA_CUBLAS=on" FORCE_CMAKE=1 pip install --timeout 100 -r requirements.txt llama-cpp-python==0.1.83
+RUN --mount=type=cache,target=/root/.cache CMAKE_ARGS="-DLLAMA_CUBLAS=ON -DLLAMA_AVX2=OFF -DLLAMA_F16C=OFF -DLLAMA_FMA=OFF" FORCE_CMAKE=1 pip install -r requirements.txt llama-cpp-python==0.1.83 --no-cache-dir
+#RUN --mount=type=cache,target=/root/.cache CMAKE_ARGS="-DLLAMA_CUBLAS=ON -AV2X=OFF" FORCE_CMAKE=1 pip install --timeout 100 -r requirements.txt llama-cpp-python==0.1.83
 COPY SOURCE_DOCUMENTS ./SOURCE_DOCUMENTS
 COPY ingest.py constants.py ./
 # Docker BuildKit does not support GPU during *docker build* time right now, only during *docker run*.
@@ -18,4 +19,4 @@ ARG device_type=cpu
 RUN --mount=type=cache,target=/root/.cache python ingest.py --device_type $device_type
 COPY . .
 ENV device_type=cuda
-CMD python run_localGPT.py --device_type $device_type
+CMD python run_localGPT_API.py

@@ -3,22 +3,18 @@ import os
 import shutil
 import subprocess
 import argparse
-
+import json
 import torch
 from flask import Flask, jsonify, request
+from werkzeug.utils import secure_filename
 from langchain.chains import RetrievalQA
 from langchain.embeddings import HuggingFaceInstructEmbeddings
-
-# from langchain.embeddings import HuggingFaceEmbeddings
 from run_localGPT import load_model
 from prompt_template_utils import get_prompt_template
-
-# from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from langchain.vectorstores import Chroma
-from werkzeug.utils import secure_filename
-
 from constants import CHROMA_SETTINGS, EMBEDDING_MODEL_NAME, PERSIST_DIRECTORY, MODEL_ID, MODEL_BASENAME
 
+# Determine the device type
 if torch.backends.mps.is_available():
     DEVICE_TYPE = "mps"
 elif torch.cuda.is_available():
@@ -30,50 +26,15 @@ SHOW_SOURCES = True
 logging.info(f"Running on: {DEVICE_TYPE}")
 logging.info(f"Display Source Documents set to: {SHOW_SOURCES}")
 
+# Initialize embeddings and vectorstore
 EMBEDDINGS = HuggingFaceInstructEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={"device": DEVICE_TYPE})
-
-# uncomment the following line if you used HuggingFaceEmbeddings in the ingest.py
-# EMBEDDINGS = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-# if os.path.exists(PERSIST_DIRECTORY):
-#     try:
-#         shutil.rmtree(PERSIST_DIRECTORY)
-#     except OSError as e:
-#         print(f"Error: {e.filename} - {e.strerror}.")
-# else:
-#     print("The directory does not exist")
-
-# run_langest_commands = ["python", "ingest.py"]
-# if DEVICE_TYPE == "cpu":
-#     run_langest_commands.append("--device_type")
-#     run_langest_commands.append(DEVICE_TYPE)
-
-# result = subprocess.run(run_langest_commands, capture_output=True)
-# if result.returncode != 0:
-#     raise FileNotFoundError(
-#         "No files were found inside SOURCE_DOCUMENTS, please put a starter file inside before starting the API!"
-#     )
-
-# load the vectorstore
-DB = Chroma(
-    persist_directory=PERSIST_DIRECTORY,
-    embedding_function=EMBEDDINGS,
-    client_settings=CHROMA_SETTINGS,
-)
-
+DB = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=EMBEDDINGS, client_settings=CHROMA_SETTINGS)
 RETRIEVER = DB.as_retriever()
 
+# Load the language model
 LLM = load_model(device_type=DEVICE_TYPE, model_id=MODEL_ID, model_basename=MODEL_BASENAME)
 prompt, memory = get_prompt_template(promptTemplate_type="llama", history=False)
-
-QA = RetrievalQA.from_chain_type(
-    llm=LLM,
-    chain_type="stuff",
-    retriever=RETRIEVER,
-    return_source_documents=SHOW_SOURCES,
-    chain_type_kwargs={
-        "prompt": prompt,
-    },
-)
+QA = RetrievalQA.from_chain_type(llm=LLM, chain_type="stuff", retriever=RETRIEVER, return_source_documents=SHOW_SOURCES, chain_type_kwargs={"prompt": prompt})
 
 app = Flask(__name__)
 
@@ -177,21 +138,67 @@ def prompt_route():
     else:
         return "No user prompt received", 400
 
+@app.route("/api/receive_user_prompt", methods=["POST"])
+def receive_user_prompt():
+    user_prompt = request.json.get("user_prompt")
+    if not user_prompt:
+        return jsonify({"error": "No user prompt received"}), 400
+    
+    retriever = DB.as_retriever()
+    qa = RetrievalQA.from_chain_type(llm=LLM, chain_type="stuff", retriever=retriever, return_source_documents=SHOW_SOURCES)
+    res = qa(user_prompt)
+    answer, docs = res["result"], res["source_documents"]
+
+    response = {
+        "Prompt": user_prompt,
+        "Answer": answer,
+        "Sources": [(os.path.basename(str(doc.metadata["source"])), str(doc.page_content)) for doc in docs]
+    }
+    return jsonify(response), 200
+
+@app.route("/process-prompt", methods=["POST"])
+def process_prompt():
+    try:
+        data = request.json
+        user_prompt = data.get("message")
+        
+        # Logic to process the prompt using LLM and DB
+        retriever = DB.as_retriever()
+        qa = RetrievalQA.from_chain_type(llm=LLM, chain_type="stuff", retriever=retriever, return_source_documents=SHOW_SOURCES)
+        res = qa(user_prompt)
+        answer, docs = res["result"], res["source_documents"]
+
+        response = {
+            "Answer": answer,
+            "Sources": [(os.path.basename(str(doc.metadata["source"])), str(doc.page_content)) for doc in docs]
+        }
+
+        return jsonify(response), 200
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# New endpoint to align with AutoGen Studio
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat_completions():
+    data = request.json
+    if not data or 'content' not in data:
+        return jsonify({"error": "No content received"}), 400
+
+    user_prompt = data['content']
+    res = QA(user_prompt)
+    answer, docs = res["result"], res["source_documents"]
+    response_dict = {
+        "prompt": user_prompt,
+        "response": answer,
+        "sources": [(os.path.basename(str(doc.metadata["source"])), str(doc.page_content)) for doc in docs]
+    }
+    return jsonify(response_dict), 200
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=5110, help="Port to run the API on. Defaults to 5110.")
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host to run the UI on. Defaults to 127.0.0.1. "
-        "Set to 0.0.0.0 to make the UI externally "
-        "accessible from other devices.",
-    )
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the UI on. Set to 0.0.0.0 for external access.")
     args = parser.parse_args()
-
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)s - %(message)s", level=logging.INFO
-    )
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)s - %(message)s", level=logging.INFO)
     app.run(debug=False, host=args.host, port=args.port)
